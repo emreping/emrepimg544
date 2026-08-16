@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+
+<title>RoadTube</title>
+
+<style>
+    * {
+        box-sizing: border-box;
+    }
+
+    html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: black;
+        font-family: Arial, sans-serif;
+    }
+
+    /* Live rear-camera view */
+    #camera {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        z-index: 1;
+    }
+
+    /* YouTube layer */
+    #youtubeLayer {
+        position: fixed;
+        inset: 0;
+        z-index: 2;
+        opacity: 0.5;
+    }
+
+    #youtube {
+        width: 100%;
+        height: 100%;
+        border: 0;
+    }
+
+    /* Controls */
+    #controls {
+        position: fixed;
+        top: env(safe-area-inset-top, 10px);
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 10;
+
+        width: min(700px, 94%);
+        padding: 10px;
+
+        background: rgba(0,0,0,0.75);
+        color: white;
+        border-radius: 12px;
+    }
+
+    #urlRow {
+        display: flex;
+        gap: 6px;
+    }
+
+    input[type="text"] {
+        flex: 1;
+        padding: 8px;
+        font-size: 16px;
+    }
+
+    button {
+        padding: 8px 12px;
+        font-size: 15px;
+    }
+
+    #opacityRow {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 8px;
+    }
+
+    #opacity {
+        flex: 1;
+    }
+</style>
+</head>
+
+<body>
+
+<video id="camera"
+       autoplay
+       muted
+       playsinline>
+</video>
+
+<div id="youtubeLayer">
+    <iframe
+        id="youtube"
+        allow="autoplay; encrypted-media; picture-in-picture"
+        allowfullscreen>
+    </iframe>
+</div>
+
+<div id="controls">
+
+    <div id="urlRow">
+        <button onclick="startCamera()">Start Camera</button>
+
+        <input
+            id="youtubeURL"
+            type="text"
+            placeholder="Paste YouTube link">
+
+        <button onclick="loadYouTube()">Load</button>
+    </div>
+
+    <div id="opacityRow">
+        <span>Camera</span>
+
+        <input
+            id="opacity"
+            type="range"
+            min="0"
+            max="100"
+            value="50"
+            oninput="changeOpacity()">
+
+        <span>YouTube</span>
+
+        <strong id="opacityText">50%</strong>
+    </div>
+
+</div>
+
+
+<script>
+
+async function startCamera() {
+    try {
+        const stream =
+            await navigator.mediaDevices.getUserMedia({
+                video: {
+                    facingMode: {
+                        ideal: "environment"
+                    }
+                },
+                audio: false
+            });
+
+        document.getElementById("camera").srcObject = stream;
+
+    } catch (error) {
+        alert(
+            "Couldn't access camera. Make sure Safari has camera permission."
+        );
+
+        console.error(error);
+    }
+}
+
+
+function extractVideoID(input) {
+
+    input = input.trim();
+
+    try {
+
+        const url = new URL(input);
+
+        /* youtu.be/VIDEO */
+        if (url.hostname.includes("youtu.be")) {
+            return url.pathname.split("/")[1];
+        }
+
+        /* youtube.com/shorts/VIDEO */
+        if (url.pathname.startsWith("/shorts/")) {
+            return url.pathname.split("/")[2];
+        }
+
+        /* youtube.com/embed/VIDEO */
+        if (url.pathname.startsWith("/embed/")) {
+            return url.pathname.split("/")[2];
+        }
+
+        /* youtube.com/watch?v=VIDEO */
+        return url.searchParams.get("v");
+
+    } catch {
+
+        /* Allows just entering a video ID */
+        return input;
+    }
+}
+
+
+function loadYouTube() {
+
+    const input =
+        document.getElementById("youtubeURL").value;
+
+    const videoID =
+        extractVideoID(input);
+
+    if (!videoID) {
+        alert("Couldn't recognise that YouTube link.");
+        return;
+    }
+
+    document.getElementById("youtube").src =
+        "https://www.youtube.com/embed/" +
+        encodeURIComponent(videoID) +
+        "?playsinline=1&rel=0";
+}
+
+
+function changeOpacity() {
+
+    const value =
+        document.getElementById("opacity").value;
+
+    const opacity =
+        value / 100;
+
+    document.getElementById("youtubeLayer").style.opacity =
+        opacity;
+
+    document.getElementById("opacityText").textContent =
+        value + "%";
+}
+
+</script>
+
+</body>
+</html>
