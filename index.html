@@ -249,7 +249,14 @@ let renderGeneration=0;
 
 let activeStroke=null;
 let activePointerId=null;
+let activePointerType=null;
 let activeGesture=null;
+
+/* Safari/iPad can occasionally surface palm contacts while Apple Pencil is
+   drawing. Never let those contacts cancel a real Pencil stroke. */
+let penIsDown=false;
+let lastPenInteraction=0;
+const PALM_GUARD_MS=160;
 let touchPoints=new Map();
 
 let lassoPoints=[];
@@ -754,10 +761,56 @@ canvas.addEventListener("pointerdown",onPointerDown,{passive:false});
 canvas.addEventListener("pointermove",onPointerMove,{passive:false});
 canvas.addEventListener("pointerup",onPointerUp,{passive:false});
 canvas.addEventListener("pointercancel",onPointerUp,{passive:false});
+canvas.addEventListener("lostpointercapture",onLostPointerCapture,{passive:false});
 
 function pointerLocal(e){
   const r=canvas.getBoundingClientRect();
   return{x:e.clientX-r.left,y:e.clientY-r.top,pressure:e.pressure||.5};
+}
+
+function pencilRecentlyActive(){
+  return penIsDown || (performance.now()-lastPenInteraction)<PALM_GUARD_MS;
+}
+
+function finaliseStaleActiveStroke(){
+  if(!activeStroke)return;
+  activeStroke=null;
+  activePointerId=null;
+  activePointerType=null;
+  commitHistoryAction();
+  scheduleRender();
+}
+
+function appendStrokeEvent(ev){
+  if(!activeStroke)return;
+  const q=pointerLocal(ev);
+  const d=screenToDoc(q.x,q.y);
+  const pt={x:d.x,y:d.y,p:q.pressure};
+
+  if(activeStroke.kind==="line"){
+    activeStroke.points=[activeStroke.points[0],pt];
+    return;
+  }
+
+  const last=activeStroke.points[activeStroke.points.length-1];
+  if(!last || Math.abs(last.x-pt.x)>.01 || Math.abs(last.y-pt.y)>.01)
+    activeStroke.points.push(pt);
+}
+
+function onLostPointerCapture(e){
+  if(e.pointerId!==activePointerId)return;
+
+  /* If Safari loses capture without delivering the normal pointerup path,
+     preserve the stroke instead of letting the next Pencil-down overwrite it. */
+  if(activeStroke){
+    activeStroke=null;
+    activePointerId=null;
+    activePointerType=null;
+    penIsDown=false;
+    lastPenInteraction=performance.now();
+    commitHistoryAction();
+    scheduleRender();
+  }
 }
 
 function cancelUncommittedTouchAction(){
@@ -767,7 +820,7 @@ function cancelUncommittedTouchAction(){
     ensureHistory(p);
     p.strokes=cloneStrokes(p.history[p.history.length-1]||[]);
   }
-  activeStroke=null;activePointerId=null;lassoPoints=[];selectionOriginal=null;
+  activeStroke=null;activePointerId=null;activePointerType=null;lassoPoints=[];selectionOriginal=null;
   if(selection.length)recomputeSelectionBox();
   activeGesture=null;
 }
@@ -775,6 +828,18 @@ function cancelUncommittedTouchAction(){
 function onPointerDown(e){
   if(mode!=="maths")return;
   e.preventDefault();
+
+  if(e.pointerType==="pen"){
+    /* A missing/cancelled pointerup must never make the next stroke disappear. */
+    if(activeStroke && activePointerId!==e.pointerId)finaliseStaleActiveStroke();
+    penIsDown=true;
+    lastPenInteraction=performance.now();
+  }
+
+  /* Palm rejection: do not even enter the touch gesture state while Pencil is
+     down (or for a tiny grace period immediately after it lifts). */
+  if(e.pointerType==="touch" && pencilRecentlyActive())return;
+
   const q=pointerLocal(e);
   const d=screenToDoc(q.x,q.y);
 
@@ -817,6 +882,7 @@ function onPointerDown(e){
   if(!canDraw)return;
 
   activePointerId=e.pointerId;
+  activePointerType=e.pointerType;
   canvas.setPointerCapture?.(e.pointerId);
 
   if(tool==="pen"||tool==="highlighter"||tool==="line"){
@@ -844,6 +910,10 @@ function onPointerDown(e){
 function onPointerMove(e){
   if(mode!=="maths")return;
   e.preventDefault();
+
+  if(e.pointerType==="pen")lastPenInteraction=performance.now();
+  if(e.pointerType==="touch" && pencilRecentlyActive())return;
+
   const q=pointerLocal(e);
 
   if(e.pointerType==="touch"){
@@ -859,11 +929,16 @@ function onPointerMove(e){
   if(e.pointerId!==activePointerId&&e.pointerType!=="touch")return;
   const d=screenToDoc(q.x,q.y);
 
-  if(activeStroke){
-    if(activeStroke.kind==="line")
-      activeStroke.points=[activeStroke.points[0],{x:d.x,y:d.y,p:q.pressure}];
-    else
-      activeStroke.points.push({x:d.x,y:d.y,p:q.pressure});
+  if(activeStroke && e.pointerId===activePointerId){
+    /* Safari 18.2+ exposes the high-frequency Pencil samples that may have
+       been coalesced into this pointermove. Using them reduces dropped gaps
+       during fast handwriting. */
+    const samples=(typeof e.getCoalescedEvents==="function")
+      ? e.getCoalescedEvents()
+      : [e];
+    if(samples.length){
+      for(const sample of samples)appendStrokeEvent(sample);
+    }else appendStrokeEvent(e);
     scheduleRender();
   }
 
@@ -896,6 +971,14 @@ function onPointerMove(e){
 function onPointerUp(e){
   e.preventDefault();
 
+  if(e.pointerType==="pen"){
+    penIsDown=false;
+    lastPenInteraction=performance.now();
+  }
+
+  /* A palm touch ignored on pointerdown should also be ignored on pointerup. */
+  if(e.pointerType==="touch" && !touchPoints.has(e.pointerId))return;
+
   if(e.pointerType==="touch"){
     touchPoints.delete(e.pointerId);
     if(activeGesture?.type==="pinch"&&touchPoints.size===1){
@@ -913,7 +996,10 @@ function onPointerUp(e){
   }
 
   if(activeStroke&&e.pointerId===activePointerId){
-    activeStroke=null;activePointerId=null;
+    /* Capture the lift coordinate too. Very short ticks/dots can otherwise
+       contain only the initial point if Safari emitted no pointermove. */
+    appendStrokeEvent(e);
+    activeStroke=null;activePointerId=null;activePointerType=null;
     commitHistoryAction();scheduleRender();
   }
 
@@ -922,7 +1008,7 @@ function onPointerUp(e){
     else if(["erase","moveSelection","resizeSelection"].includes(activeGesture.type))
       commitHistoryAction();
 
-    activeGesture=null;activePointerId=null;selectionOriginal=null;
+    activeGesture=null;activePointerId=null;activePointerType=null;selectionOriginal=null;
     scheduleRender();
   }
 }
