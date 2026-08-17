@@ -6,6 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#000000">
 <title>Car Study</title>
+<meta name="car-study-build" content="pencil-recovery-r4-20260817">
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/4.2.1/jspdf.umd.min.js"></script>
@@ -102,7 +103,7 @@ select{padding:6px 8px}
 #fileInput{display:none}
 #inputDebug{
   position:fixed;z-index:90;right:max(10px,env(safe-area-inset-right));
-  top:190px;display:none;max-width:280px;padding:8px 10px;border-radius:10px;
+  top:190px;display:none;max-width:340px;padding:8px 10px;border-radius:10px;
   background:rgba(0,0,0,.78);border:1px solid rgba(255,255,255,.15);
   color:#fff;font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;
   pointer-events:none;white-space:pre-line
@@ -279,6 +280,24 @@ let penIsDown=false;
 let lastPenInteraction=0;
 const PALM_GUARD_MS=160;
 let touchPoints=new Map();
+
+/* Maximum-reliability Pencil recovery. Safari can occasionally miss a rapid
+   pen pointerdown. These variables let us recover from later pen movement or
+   from the independent Touch Events stream without double-drawing. */
+const BUILD_ID="Pencil Recovery R4";
+const ORPHAN_PRESSURE_MIN=0.001;
+const TOUCH_FALLBACK_DELAY_MS=12;
+const RAPID_PENCIL_CONTEXT_MS=500;
+const SMALL_STYLUS_RADIUS=4.5;
+let activePenSource=null;            // pointer | touch-fallback | null
+let lastPointerPenEventAt=-Infinity;
+let lastConfirmedPenAt=-Infinity;
+let stylusTouchCandidate=null;       // delayed Touch Events fallback candidate
+let activeTouchFallbackIdentifier=null;
+let pointerClaimedTouchIds=new Set(); // TouchEvent contacts already owned by Pointer Events
+let lastPenCommitAt=-Infinity;
+let lastPenCommitPoint=null;
+let lastTouchMetrics="none";
 
 let lassoPoints=[];
 let selection=[];
@@ -778,14 +797,38 @@ function makeStroke(kind,p){
 }
 
 /* ---------- POINTER / PENCIL / FINGER ---------- */
+/*
+   Reliability strategy on iPad Safari:
+   1) Pointer Events are the normal/fast path.
+   2) If Safari misses pointerdown but later emits an in-contact pen pointermove,
+      pressure/buttons let us synthesize the missing start.
+   3) Touch Events run in parallel as a conservative Apple-Pencil fallback.
+      Safari 18.2+ exposes stylus angle information in the modern input stack;
+      we also use small contact radius + recent confirmed Pencil activity as a
+      fallback classifier. A short delay gives normal Pointer Events first
+      refusal, preventing duplicate strokes.
+   4) A pen click can rescue the rare tiny tap where only a click survives.
+*/
 canvas.addEventListener("pointerdown",onPointerDown,{passive:false,capture:true});
-canvas.addEventListener("pointermove",onPointerMove,{passive:false});
+canvas.addEventListener("pointermove",onPointerMove,{passive:false,capture:true});
 canvas.addEventListener("pointerup",onPointerUp,{passive:false,capture:true});
 canvas.addEventListener("pointercancel",onPointerCancel,{passive:false,capture:true});
+/* Feature-detected by event delivery: browsers that implement Pointer Events
+   Level 3 may emit pointerrawupdate. We use it ONLY to recover a missing start,
+   never to double-sample an already active stroke. */
+canvas.addEventListener("pointerrawupdate",onPointerRawRecovery,{passive:false,capture:true});
+canvas.addEventListener("click",onPenClickFallback,{passive:false,capture:true});
 
-/* iPad Safari can try to turn Pencil gestures into browser UI actions.
-   The maths canvas is an application surface, so none of those native
-   selection/callout/drag gestures are useful here. */
+/* Legacy Touch Events are deliberately a SECONDARY channel. They are useful
+   when WebKit fails to deliver the beginning of a very rapid PointerEvent pen
+   contact. They never replace normal finger pan/pinch handling. */
+canvas.addEventListener("touchstart",onTouchFallbackStart,{passive:false,capture:true});
+canvas.addEventListener("touchmove",onTouchFallbackMove,{passive:false,capture:true});
+canvas.addEventListener("touchend",onTouchFallbackEnd,{passive:false,capture:true});
+canvas.addEventListener("touchcancel",onTouchFallbackCancel,{passive:false,capture:true});
+
+/* The maths canvas is an application surface; native text selection, callouts,
+   drag actions and Safari gesture UI only compete with Pencil input. */
 for(const eventName of ["selectstart","contextmenu","dragstart","gesturestart","gesturechange","gestureend"]){
   document.addEventListener(eventName,e=>{
     if(e.target===canvas || document.getElementById("workspace").contains(e.target)){
@@ -795,36 +838,39 @@ for(const eventName of ["selectstart","contextmenu","dragstart","gesturestart","
   },{capture:true,passive:false});
 }
 
-/* If Safari somehow creates a DOM selection while Pencil-writing, clear it. */
 document.addEventListener("selectionchange",()=>{
   if(mode!=="maths")return;
   const sel=window.getSelection?.();
-  if(sel && !sel.isCollapsed) sel.removeAllRanges();
+  if(sel && !sel.isCollapsed)sel.removeAllRanges();
 });
 
 function pointerLocal(e){
   const r=canvas.getBoundingClientRect();
-  return{x:e.clientX-r.left,y:e.clientY-r.top,pressure:e.pressure||.5};
+  return{x:e.clientX-r.left,y:e.clientY-r.top,pressure:normalisePressure(e.pressure)};
 }
-
+function touchLocal(t){
+  const r=canvas.getBoundingClientRect();
+  return{x:t.clientX-r.left,y:t.clientY-r.top,pressure:normalisePressure(t.force)};
+}
+function normalisePressure(v){
+  return Number.isFinite(Number(v)) && Number(v)>0 ? Math.min(1,Number(v)) : .5;
+}
 function pencilRecentlyActive(){
   return penIsDown || (performance.now()-lastPenInteraction)<PALM_GUARD_MS;
 }
-
-function finaliseStaleActiveStroke(){
-  if(!activeStroke)return;
-  activeStroke=null;
-  activePointerId=null;
-  activePointerType=null;
-  commitHistoryAction();
-  scheduleRender();
+function penEventShowsContact(e){
+  return Number(e.pressure)>ORPHAN_PRESSURE_MIN || ((Number(e.buttons)||0)&1)===1;
 }
+function sourceIsPen(type){
+  return type==="pen" || type==="pen-orphan" || type==="pen-touch" || type==="pen-click";
+}
+function makeSourceId(prefix,id){return `${prefix}:${id}`;}
 
-function appendStrokeEvent(ev){
+function appendStrokeClientPoint(clientX,clientY,pressure=.5){
   if(!activeStroke)return;
-  const q=pointerLocal(ev);
-  const d=screenToDoc(q.x,q.y);
-  const pt={x:d.x,y:d.y,p:q.pressure};
+  const r=canvas.getBoundingClientRect();
+  const d=screenToDoc(clientX-r.left,clientY-r.top);
+  const pt={x:d.x,y:d.y,p:normalisePressure(pressure)};
 
   if(activeStroke.kind==="line"){
     activeStroke.points=[activeStroke.points[0],pt];
@@ -835,18 +881,123 @@ function appendStrokeEvent(ev){
   if(!last || Math.abs(last.x-pt.x)>.01 || Math.abs(last.y-pt.y)>.01)
     activeStroke.points.push(pt);
 }
+function appendStrokeEvent(ev){
+  appendStrokeClientPoint(ev.clientX,ev.clientY,ev.pressure);
+}
+function appendStrokeTouch(t){
+  appendStrokeClientPoint(t.clientX,t.clientY,t.force);
+}
 
+function clearNavigationForPen(){
+  /* Pencil wins over an accidental palm/finger navigation gesture. If finger
+     drawing happened to be active too, roll that uncommitted finger action
+     back before starting the Pencil action. */
+  if((activeStroke||activeGesture)&&!sourceIsPen(activePointerType))
+    cancelUncommittedTouchAction();
+  if(["pan","pinch"].includes(activeGesture?.type))activeGesture=null;
+  touchPoints.clear();
+}
+
+function beginDrawingActionAt(d,pressure,sourceId,sourceType){
+  activePointerId=sourceId;
+  activePointerType=sourceType;
+  if(sourceIsPen(sourceType))activePenSource=sourceType;
+
+  if(tool==="pen"||tool==="highlighter"||tool==="line"){
+    beginHistoryAction();
+    activeStroke=makeStroke(tool,{...d,pressure:normalisePressure(pressure)});
+    currentPage().strokes.push(activeStroke);
+    scheduleRender();
+  }else if(tool==="eraser"){
+    beginHistoryAction();
+    activeGesture={type:"erase",pointerId:sourceId};
+    eraseAt(d);
+  }else if(tool==="lasso"){
+    if(selection.length&&isNearResizeHandle(d)){
+      beginHistoryAction();selectionOriginal=cloneSelected();
+      activeGesture={type:"resizeSelection",pointerId:sourceId,start:d,box:{...selectionBox}};
+    }else if(selection.length&&pointInBox(d,selectionBox)){
+      beginHistoryAction();selectionOriginal=cloneSelected();
+      activeGesture={type:"moveSelection",pointerId:sourceId,start:d};
+    }else{
+      clearSelection(false);lassoPoints=[d];
+      activeGesture={type:"lasso",pointerId:sourceId};
+    }
+  }
+}
+
+function markPenCommit(q=null){
+  lastPenCommitAt=performance.now();
+  if(q){
+    const x=Number.isFinite(Number(q.clientX))?Number(q.clientX):Number(q.x);
+    const y=Number.isFinite(Number(q.clientY))?Number(q.clientY):Number(q.y);
+    if(Number.isFinite(x)&&Number.isFinite(y))lastPenCommitPoint={x,y};
+  }
+  inputStats.strokesCommitted++;
+  updateInputDebug();
+}
+
+function finishActiveAction(sourceId,finalClientPoint=null,{cancelled=false}={}){
+  const wasPen=sourceIsPen(activePointerType);
+  let changed=false;
+
+  if(activeStroke && sourceId===activePointerId){
+    if(finalClientPoint)
+      appendStrokeClientPoint(finalClientPoint.clientX,finalClientPoint.clientY,finalClientPoint.pressure);
+    activeStroke=null;
+    commitHistoryAction();
+    changed=true;
+  }
+
+  if(activeGesture?.pointerId===sourceId){
+    if(activeGesture.type==="lasso")finishLasso();
+    else if(["erase","moveSelection","resizeSelection"].includes(activeGesture.type))commitHistoryAction();
+    activeGesture=null;selectionOriginal=null;
+    changed=true;
+  }
+
+  if(sourceId===activePointerId){
+    activePointerId=null;activePointerType=null;
+  }
+  if(wasPen){
+    activePenSource=null;
+    if(changed)markPenCommit(finalClientPoint);
+  }
+  if(changed)scheduleRender();
+}
+
+function finaliseStaleActiveStroke(){
+  if(!activeStroke && !activeGesture)return;
+  const id=activePointerId;
+  finishActiveAction(id,null,{cancelled:true});
+}
+
+/* ---------------- DEBUG ---------------- */
 let inputDebugEnabled=false;
-let inputStats={penDown:0,penUp:0,penCancel:0,strokesCommitted:0,last:"none"};
-
+let inputStats={
+  penDown:0,penMove:0,penUp:0,penCancel:0,
+  orphanRecovered:0,touchSeen:0,touchStylus:0,touchFallback:0,
+  touchCommitted:0,touchAdopted:0,clickRecovered:0,
+  strokesCommitted:0,last:"none"
+};
 function updateInputDebug(){
   if(!inputDebugEnabled)return;
   const d=document.getElementById("inputDebug");
-  d.textContent=`pen down: ${inputStats.penDown}
-pen up: ${inputStats.penUp}
-pen cancel: ${inputStats.penCancel}
-committed: ${inputStats.strokesCommitted}
-last: ${inputStats.last}`;
+  d.textContent=`build: ${BUILD_ID}
+pointer pen down: ${inputStats.penDown}
+pointer pen move: ${inputStats.penMove}
+pointer pen up: ${inputStats.penUp}
+pointer cancel: ${inputStats.penCancel}
+orphan-move recovered: ${inputStats.orphanRecovered}
+touch starts seen: ${inputStats.touchSeen}
+touch stylus candidates: ${inputStats.touchStylus}
+touch fallback starts: ${inputStats.touchFallback}
+touch fallback commits: ${inputStats.touchCommitted}
+touchâpointer adopts: ${inputStats.touchAdopted}
+click recoveries: ${inputStats.clickRecovered}
+pen strokes committed: ${inputStats.strokesCommitted}
+last touch: ${lastTouchMetrics}
+last event: ${inputStats.last}`;
 }
 function toggleInputDebug(){
   inputDebugEnabled=!inputDebugEnabled;
@@ -858,141 +1009,303 @@ function noteInput(kind,e){
   inputStats.last=`${kind} ${e.pointerType||"?"} id=${e.pointerId??"?"}`;
   updateInputDebug();
 }
-
-function onPointerCancel(e){
-  e.preventDefault();
-  if(e.pointerType==="pen"){
-    inputStats.penCancel++;
-    noteInput("CANCEL",e);
-    penIsDown=false;
-    lastPenInteraction=performance.now();
-  }
-
-  /* A cancellation should preserve whatever ink Safari already delivered,
-     rather than treating it like a failed/rolled-back stroke. */
-  if(activeStroke && e.pointerId===activePointerId){
-    activeStroke=null;activePointerId=null;activePointerType=null;
-    commitHistoryAction();
-    inputStats.strokesCommitted++;updateInputDebug();
-    scheduleRender();
-  }
-
-  if(activeGesture?.pointerId===e.pointerId){
-    if(activeGesture.type==="lasso")finishLasso();
-    else if(["erase","moveSelection","resizeSelection"].includes(activeGesture.type))
-      commitHistoryAction();
-    activeGesture=null;selectionOriginal=null;scheduleRender();
-  }
-
-  touchPoints.delete(e.pointerId);
+function describeTouch(t){
+  const rx=Number(t.radiusX),ry=Number(t.radiusY),f=Number(t.force),alt=Number(t.altitudeAngle);
+  const fmt=n=>Number.isFinite(n)?n.toFixed(2):"?";
+  return `r=${fmt(Math.max(rx||0,ry||0))} f=${fmt(f)} alt=${fmt(alt)} type=${String(t.touchType??"?")}`;
 }
 
-function cancelUncommittedTouchAction(){
-  const p=currentPage();
-  const mutating=activeStroke || ["erase","moveSelection","resizeSelection"].includes(activeGesture?.type);
-  if(mutating){
-    ensureHistory(p);
-    p.strokes=cloneStrokes(p.history[p.history.length-1]||[]);
-  }
-  activeStroke=null;activePointerId=null;activePointerType=null;lassoPoints=[];selectionOriginal=null;
-  if(selection.length)recomputeSelectionBox();
-  activeGesture=null;
+/* ---------------- TOUCH FALLBACK CLASSIFICATION ---------------- */
+function touchLooksLikeStylus(t){
+  const type=String(t.touchType??"").toLowerCase();
+  if(type.includes("stylus")||type.includes("pen"))return true;
+
+  /* A real transducer angle is a strong stylus signal. */
+  const alt=Number(t.altitudeAngle);
+  if(Number.isFinite(alt)&&alt>0.01)return true;
+
+  const rx=Number(t.radiusX),ry=Number(t.radiusY);
+  const radius=(Number.isFinite(rx)&&Number.isFinite(ry))?Math.max(rx,ry):Infinity;
+  const force=Number(t.force);
+  const small=radius>0&&radius<=SMALL_STYLUS_RADIUS;
+
+  /* Conservative standalone heuristic: tiny contact + actual force. */
+  if(small&&Number.isFinite(force)&&force>0)return true;
+
+  /* Rapid missing contacts are the user's observed failure mode. If a tiny
+     Touch contact follows a confirmed Pencil event almost immediately, treat
+     it as Pencil even if Safari omitted stylus metadata on TouchEvent. */
+  if(small&&(performance.now()-lastConfirmedPenAt)<RAPID_PENCIL_CONTEXT_MS)return true;
+
+  return false;
+}
+function cancelStylusTouchCandidate(){
+  if(stylusTouchCandidate?.timer)clearTimeout(stylusTouchCandidate.timer);
+  stylusTouchCandidate=null;
+}
+function candidateStillValid(c){
+  return stylusTouchCandidate===c && !activePenSource && !penIsDown;
+}
+function startTouchFallback(c,reason="timer"){
+  if(!c||!candidateStillValid(c))return false;
+  cancelStylusTouchCandidate();
+  clearNavigationForPen();
+
+  const sourceId=makeSourceId("touchpen",c.id);
+  const d=screenToDoc(c.lastQ.x,c.lastQ.y);
+  beginDrawingActionAt(d,c.lastQ.pressure,sourceId,"pen-touch");
+  activeTouchFallbackIdentifier=c.id;
+  penIsDown=true;
+  lastPenInteraction=performance.now();
+  inputStats.touchFallback++;
+  inputStats.last=`TOUCH FALLBACK (${reason}) id=${c.id}`;
+  updateInputDebug();
+  return true;
+}
+function adoptTouchFallbackToPointer(e){
+  if(activePenSource!=="pen-touch"||activeTouchFallbackIdentifier===null)return false;
+  const oldId=activePointerId;
+  pointerClaimedTouchIds.add(activeTouchFallbackIdentifier);
+  activePointerId=e.pointerId;
+  activePointerType="pen";
+  activePenSource="pointer";
+  if(activeGesture?.pointerId===oldId)activeGesture.pointerId=e.pointerId;
+  activeTouchFallbackIdentifier=null;
+  cancelStylusTouchCandidate();
+  inputStats.touchAdopted++;
+  inputStats.last=`ADOPT touchâpointer id=${e.pointerId}`;
+  updateInputDebug();
+  return true;
 }
 
+function onTouchFallbackStart(e){
+  if(mode!=="maths")return;
+  for(const t of Array.from(e.changedTouches||[])){
+    inputStats.touchSeen++;
+    lastTouchMetrics=describeTouch(t);
+    if(!touchLooksLikeStylus(t))continue;
+    inputStats.touchStylus++;
+
+    /* If Pointer Events already own THIS contact, Touch is duplicate. If the
+       previous pen lifecycle got stuck without an up/cancel, a new stylus
+       touchstart is authoritative evidence that the old contact ended. */
+    if(penIsDown||sourceIsPen(activePointerType)){
+      const age=performance.now()-lastPointerPenEventAt;
+      if(age<20){pointerClaimedTouchIds.add(t.identifier);continue;}
+      if(sourceIsPen(activePointerType))finaliseStaleActiveStroke();
+      penIsDown=false;activePenSource=null;
+    }
+
+    const q=touchLocal(t);
+    const c={id:t.identifier,startQ:q,lastQ:q,startedAt:performance.now(),timer:null};
+    cancelStylusTouchCandidate();
+    stylusTouchCandidate=c;
+    c.timer=setTimeout(()=>startTouchFallback(c,"delay"),TOUCH_FALLBACK_DELAY_MS);
+    inputStats.last=`TOUCH candidate id=${t.identifier}`;
+  }
+  updateInputDebug();
+}
+function onTouchFallbackMove(e){
+  if(mode!=="maths")return;
+  for(const t of Array.from(e.changedTouches||[])){
+    if(pointerClaimedTouchIds.has(t.identifier))continue;
+    /* Some broken input sequences can lose the start event itself. A stylus-
+       looking move is enough to create a fallback candidate. */
+    if(!stylusTouchCandidate && !activePenSource && !penIsDown && touchLooksLikeStylus(t)){
+      inputStats.touchStylus++;
+      const q=touchLocal(t);
+      stylusTouchCandidate={id:t.identifier,startQ:q,lastQ:q,startedAt:performance.now(),timer:null};
+      inputStats.last=`TOUCH MOVE candidate id=${t.identifier}`;
+    }
+    if(stylusTouchCandidate?.id===t.identifier){
+      stylusTouchCandidate.lastQ=touchLocal(t);
+      /* Movement is strong evidence of a real missed contact; don't wait out
+         the timer if Pointer Events still haven't claimed it. */
+      if(!activePenSource&&!penIsDown)startTouchFallback(stylusTouchCandidate,"move");
+    }
+    if(activePenSource==="pen-touch"&&activeTouchFallbackIdentifier===t.identifier){
+      e.preventDefault();
+      appendStrokeTouch(t);
+      const d=screenToDoc(touchLocal(t).x,touchLocal(t).y);
+      if(activeGesture?.type==="erase")eraseAt(d);
+      else if(activeGesture?.type==="lasso"){lassoPoints.push(d);}
+      else if(activeGesture?.type==="moveSelection"){
+        const dx=d.x-activeGesture.start.x,dy=d.y-activeGesture.start.y;
+        applySelectionFromOriginal(pt=>({x:pt.x+dx,y:pt.y+dy}));recomputeSelectionBox();
+      }else if(activeGesture?.type==="resizeSelection")resizeSelectionTo(d);
+      scheduleRender();
+    }
+  }
+}
+function onTouchFallbackEnd(e){
+  if(mode!=="maths")return;
+  for(const t of Array.from(e.changedTouches||[])){
+    if(pointerClaimedTouchIds.has(t.identifier)){
+      pointerClaimedTouchIds.delete(t.identifier);
+      continue;
+    }
+    if(!stylusTouchCandidate && !activePenSource && !penIsDown && touchLooksLikeStylus(t)){
+      inputStats.touchStylus++;
+      const q=touchLocal(t);
+      stylusTouchCandidate={id:t.identifier,startQ:q,lastQ:q,startedAt:performance.now(),timer:null};
+      inputStats.last=`TOUCH END candidate id=${t.identifier}`;
+    }
+    if(stylusTouchCandidate?.id===t.identifier){
+      stylusTouchCandidate.lastQ=touchLocal(t);
+      /* This recovers an ultra-short tap where no pointermove was produced. */
+      startTouchFallback(stylusTouchCandidate,"touchend");
+    }
+    if(activePenSource==="pen-touch"&&activeTouchFallbackIdentifier===t.identifier){
+      e.preventDefault();
+      const sourceId=activePointerId;
+      const q={clientX:t.clientX,clientY:t.clientY,pressure:normalisePressure(t.force)};
+      finishActiveAction(sourceId,q);
+      activeTouchFallbackIdentifier=null;
+      penIsDown=false;lastPenInteraction=performance.now();
+      inputStats.touchCommitted++;
+      inputStats.last=`TOUCH COMMIT id=${t.identifier}`;
+      updateInputDebug();
+    }
+  }
+  if(stylusTouchCandidate && Array.from(e.changedTouches||[]).some(t=>t.identifier===stylusTouchCandidate.id))
+    cancelStylusTouchCandidate();
+}
+function onTouchFallbackCancel(e){
+  if(mode!=="maths")return;
+  for(const t of Array.from(e.changedTouches||[])){
+    if(pointerClaimedTouchIds.has(t.identifier)){
+      pointerClaimedTouchIds.delete(t.identifier);
+      continue;
+    }
+    if(activePenSource==="pen-touch"&&activeTouchFallbackIdentifier===t.identifier){
+      const sourceId=activePointerId;
+      finishActiveAction(sourceId,null,{cancelled:true});
+      activeTouchFallbackIdentifier=null;
+      penIsDown=false;lastPenInteraction=performance.now();
+      inputStats.touchCommitted++;
+      inputStats.last=`TOUCH CANCEL-COMMIT id=${t.identifier}`;
+    }
+  }
+  cancelStylusTouchCandidate();
+  updateInputDebug();
+}
+
+/* ---------------- POINTER EVENTS PRIMARY PATH ---------------- */
 function onPointerDown(e){
   if(mode!=="maths")return;
   e.preventDefault();
 
   if(e.pointerType==="pen"){
     e.stopPropagation();
+    const now=performance.now();
     inputStats.penDown++;noteInput("DOWN",e);
-    /* A missing/cancelled pointerup must never make the next stroke disappear. */
-    if(activeStroke && activePointerId!==e.pointerId)finaliseStaleActiveStroke();
-    penIsDown=true;
-    lastPenInteraction=performance.now();
+    lastPointerPenEventAt=now;lastConfirmedPenAt=now;
+    penIsDown=true;lastPenInteraction=now;
+    clearNavigationForPen();
+    if(stylusTouchCandidate)pointerClaimedTouchIds.add(stylusTouchCandidate.id);
+
+    /* If Touch fallback beat a late pointerdown by a few milliseconds, adopt
+       the existing stroke instead of drawing a duplicate. */
+    if(adoptTouchFallbackToPointer(e)){
+      appendStrokeEvent(e);
+      scheduleRender();
+      return;
+    }
+    cancelStylusTouchCandidate();
+
+    /* A truly stale unfinished prior stroke should never block the next one. */
+    if((activeStroke||activeGesture)&&sourceIsPen(activePointerType))finaliseStaleActiveStroke();
+
+    const q=pointerLocal(e),d=screenToDoc(q.x,q.y);
+    beginDrawingActionAt(d,q.pressure,e.pointerId,"pen");
+    return;
   }
 
-  /* Palm rejection: do not even enter the touch gesture state while Pencil is
-     down (or for a tiny grace period immediately after it lifts). */
-  if(e.pointerType==="touch" && pencilRecentlyActive())return;
+  /* Palm rejection applies to finger PointerEvents, not the stylus-aware
+     Touch fallback above. */
+  if(e.pointerType==="touch"&&pencilRecentlyActive())return;
 
-  const q=pointerLocal(e);
-  const d=screenToDoc(q.x,q.y);
+  const q=pointerLocal(e),d=screenToDoc(q.x,q.y);
 
   if(e.pointerType==="touch"){
     touchPoints.set(e.pointerId,q);
-
-    /* A second finger always means navigation, never an accidental ink mark. */
     if(touchPoints.size>=2){
-      cancelUncommittedTouchAction();
-      startPinch();
-      return;
+      cancelUncommittedTouchAction();startPinch();return;
     }
-
-    /* In Lasso mode, a finger can drag/resize an existing selection. */
     if(tool==="lasso"&&selection.length){
       if(isNearResizeHandle(d)){
         beginHistoryAction();selectionOriginal=cloneSelected();
-        activeGesture={type:"resizeSelection",pointerId:e.pointerId,start:d,box:{...selectionBox}};
-        return;
+        activeGesture={type:"resizeSelection",pointerId:e.pointerId,start:d,box:{...selectionBox}};return;
       }
       if(pointInBox(d,selectionBox)){
         beginHistoryAction();selectionOriginal=cloneSelected();
-        activeGesture={type:"moveSelection",pointerId:e.pointerId,start:d};
-        return;
+        activeGesture={type:"moveSelection",pointerId:e.pointerId,start:d};return;
       }
     }
-
     if(!document.getElementById("fingerDraw").checked){
-      activeGesture={
-        type:"pan",pointerId:e.pointerId,start:q,
-        panX:currentPage().view.panX,panY:currentPage().view.panY
-      };
+      activeGesture={type:"pan",pointerId:e.pointerId,start:q,panX:currentPage().view.panX,panY:currentPage().view.panY};
       return;
     }
   }
 
-  const canDraw=
-    e.pointerType==="pen"||e.pointerType==="mouse"||
-    (e.pointerType==="touch"&&document.getElementById("fingerDraw").checked);
+  const canDraw=e.pointerType==="mouse"||(e.pointerType==="touch"&&document.getElementById("fingerDraw").checked);
   if(!canDraw)return;
-
-  activePointerId=e.pointerId;
-  activePointerType=e.pointerType;
-  /* Pointer capture is useful for fingers, but Safari's Pencil capture path
-     can generate awkward lifecycle events. The canvas already fills the
-     workspace, so we deliberately avoid capture for Pencil. */
-  if(e.pointerType!=="pen") canvas.setPointerCapture?.(e.pointerId);
-
-  if(tool==="pen"||tool==="highlighter"||tool==="line"){
-    beginHistoryAction();
-    activeStroke=makeStroke(tool,{...d,pressure:q.pressure});
-    currentPage().strokes.push(activeStroke);scheduleRender();
-  }else if(tool==="eraser"){
-    beginHistoryAction();
-    activeGesture={type:"erase",pointerId:e.pointerId};
-    eraseAt(d);
-  }else if(tool==="lasso"){
-    if(selection.length&&isNearResizeHandle(d)){
-      beginHistoryAction();selectionOriginal=cloneSelected();
-      activeGesture={type:"resizeSelection",pointerId:e.pointerId,start:d,box:{...selectionBox}};
-    }else if(selection.length&&pointInBox(d,selectionBox)){
-      beginHistoryAction();selectionOriginal=cloneSelected();
-      activeGesture={type:"moveSelection",pointerId:e.pointerId,start:d};
-    }else{
-      clearSelection(false);lassoPoints=[d];
-      activeGesture={type:"lasso",pointerId:e.pointerId};
-    }
-  }
+  if(e.pointerType!=="pen")canvas.setPointerCapture?.(e.pointerId);
+  beginDrawingActionAt(d,q.pressure,e.pointerId,e.pointerType);
 }
 
 function onPointerMove(e){
   if(mode!=="maths")return;
   e.preventDefault();
 
-  if(e.pointerType==="pen"){e.stopPropagation();lastPenInteraction=performance.now();}
-  if(e.pointerType==="touch" && pencilRecentlyActive())return;
+  if(e.pointerType==="pen"){
+    e.stopPropagation();
+    const now=performance.now();
+    inputStats.penMove++;
+    lastPointerPenEventAt=now;lastPenInteraction=now;
 
+    const contact=penEventShowsContact(e);
+    if(contact){
+      lastConfirmedPenAt=now;
+      penIsDown=true;
+      clearNavigationForPen();
+
+      if(activePenSource==="pen-touch")adoptTouchFallbackToPointer(e);
+
+      /* Core recovery: if Safari skipped pointerdown but gives us a pressured
+         pen pointermove, synthesize the missing start right here. */
+      const noMatchingPenAction=!sourceIsPen(activePointerType)||activePointerId!==e.pointerId;
+      if(noMatchingPenAction){
+        if((activeStroke||activeGesture)&&sourceIsPen(activePointerType))finaliseStaleActiveStroke();
+        cancelStylusTouchCandidate();
+        const q=pointerLocal(e),d=screenToDoc(q.x,q.y);
+        beginDrawingActionAt(d,q.pressure,e.pointerId,"pen-orphan");
+        inputStats.orphanRecovered++;
+        inputStats.last=`ORPHAN MOVE RECOVERED id=${e.pointerId}`;
+        updateInputDebug();
+      }
+    }
+
+    if(sourceIsPen(activePointerType)&&activePointerId===e.pointerId){
+      const samples=(typeof e.getCoalescedEvents==="function")?e.getCoalescedEvents():[];
+      if(samples.length){for(const sample of samples)appendStrokeEvent(sample)}
+      else appendStrokeEvent(e);
+
+      const q=pointerLocal(e),d=screenToDoc(q.x,q.y);
+      if(activeGesture?.type==="erase")eraseAt(d);
+      else if(activeGesture?.type==="lasso"){lassoPoints.push(d)}
+      else if(activeGesture?.type==="moveSelection"){
+        const dx=d.x-activeGesture.start.x,dy=d.y-activeGesture.start.y;
+        applySelectionFromOriginal(pt=>({x:pt.x+dx,y:pt.y+dy}));recomputeSelectionBox();
+      }else if(activeGesture?.type==="resizeSelection"){
+        resizeSelectionTo(d);
+      }
+      scheduleRender();
+    }
+    return;
+  }
+
+  if(e.pointerType==="touch"&&pencilRecentlyActive())return;
   const q=pointerLocal(e);
 
   if(e.pointerType==="touch"){
@@ -1008,91 +1321,120 @@ function onPointerMove(e){
   if(e.pointerId!==activePointerId&&e.pointerType!=="touch")return;
   const d=screenToDoc(q.x,q.y);
 
-  if(activeStroke && e.pointerId===activePointerId){
-    /* Safari 18.2+ exposes the high-frequency Pencil samples that may have
-       been coalesced into this pointermove. Using them reduces dropped gaps
-       during fast handwriting. */
-    const samples=(typeof e.getCoalescedEvents==="function")
-      ? e.getCoalescedEvents()
-      : [e];
-    if(samples.length){
-      for(const sample of samples)appendStrokeEvent(sample);
-    }else appendStrokeEvent(e);
-    scheduleRender();
-  }
-
-  if(activeGesture?.type==="erase"&&activeGesture.pointerId===e.pointerId){
-    eraseAt(d);
-  }else if(activeGesture?.type==="lasso"&&activeGesture.pointerId===e.pointerId){
-    lassoPoints.push(d);scheduleRender();
-  }else if(activeGesture?.type==="moveSelection"&&activeGesture.pointerId===e.pointerId){
+  if(activeStroke&&e.pointerId===activePointerId){appendStrokeEvent(e);scheduleRender()}
+  if(activeGesture?.type==="erase"&&activeGesture.pointerId===e.pointerId)eraseAt(d);
+  else if(activeGesture?.type==="lasso"&&activeGesture.pointerId===e.pointerId){lassoPoints.push(d);scheduleRender()}
+  else if(activeGesture?.type==="moveSelection"&&activeGesture.pointerId===e.pointerId){
     const dx=d.x-activeGesture.start.x,dy=d.y-activeGesture.start.y;
-    applySelectionFromOriginal(pt=>({x:pt.x+dx,y:pt.y+dy}));
-    recomputeSelectionBox();scheduleRender();
+    applySelectionFromOriginal(pt=>({x:pt.x+dx,y:pt.y+dy}));recomputeSelectionBox();scheduleRender();
   }else if(activeGesture?.type==="resizeSelection"&&activeGesture.pointerId===e.pointerId){
-    const b=activeGesture.box;
-    const bw=Math.max(10,b.maxX-b.minX),bh=Math.max(10,b.maxY-b.minY);
-    const sx=Math.max(.12,(d.x-b.minX)/bw);
-    const sy=Math.max(.12,(d.y-b.minY)/bh);
-    applySelectionFromOriginal(pt=>({
-      x:b.minX+(pt.x-b.minX)*sx,
-      y:b.minY+(pt.y-b.minY)*sy
-    }));
-    const widthScale=Math.sqrt(sx*sy);
-    for(const stroke of currentPage().strokes){
-      if(selection.includes(stroke.id)&&selectionOriginal?.[stroke.id])
-        stroke.width=selectionOriginal[stroke.id].width*widthScale;
-    }
-    recomputeSelectionBox();scheduleRender();
+    resizeSelectionTo(d);scheduleRender();
   }
 }
 
+function resizeSelectionTo(d){
+  const b=activeGesture.box;
+  const bw=Math.max(10,b.maxX-b.minX),bh=Math.max(10,b.maxY-b.minY);
+  const sx=Math.max(.12,(d.x-b.minX)/bw),sy=Math.max(.12,(d.y-b.minY)/bh);
+  applySelectionFromOriginal(pt=>({x:b.minX+(pt.x-b.minX)*sx,y:b.minY+(pt.y-b.minY)*sy}));
+  const widthScale=Math.sqrt(sx*sy);
+  for(const stroke of currentPage().strokes){
+    if(selection.includes(stroke.id)&&selectionOriginal?.[stroke.id])
+      stroke.width=selectionOriginal[stroke.id].width*widthScale;
+  }
+  recomputeSelectionBox();
+}
+
+function onPointerRawRecovery(e){
+  if(mode!=="maths"||e.pointerType!=="pen"||!penEventShowsContact(e))return;
+  const matching=sourceIsPen(activePointerType)&&activePointerId===e.pointerId;
+  if(matching)return;
+  /* Reuse the fully deduplicated orphan-move recovery path. */
+  onPointerMove(e);
+}
+
 function onPointerUp(e){
+  if(mode!=="maths")return;
   e.preventDefault();
 
   if(e.pointerType==="pen"){
     e.stopPropagation();
+    const now=performance.now();
     inputStats.penUp++;noteInput("UP",e);
-    penIsDown=false;
-    lastPenInteraction=performance.now();
+    lastPointerPenEventAt=now;lastConfirmedPenAt=now;
+    lastPenInteraction=now;penIsDown=false;
+    cancelStylusTouchCandidate();
+
+    if(activePenSource==="pen-touch")adoptTouchFallbackToPointer(e);
+
+    if(sourceIsPen(activePointerType)&&activePointerId===e.pointerId){
+      const q={clientX:e.clientX,clientY:e.clientY,pressure:normalisePressure(e.pressure)};
+      finishActiveAction(e.pointerId,q);
+    }
+    activeTouchFallbackIdentifier=null;
+    return;
   }
 
-  /* A palm touch ignored on pointerdown should also be ignored on pointerup. */
-  if(e.pointerType==="touch" && !touchPoints.has(e.pointerId))return;
-
+  if(e.pointerType==="touch"&&!touchPoints.has(e.pointerId))return;
   if(e.pointerType==="touch"){
     touchPoints.delete(e.pointerId);
     if(activeGesture?.type==="pinch"&&touchPoints.size===1){
-      const [remainingId,remainingPoint]=touchPoints.entries().next().value;
-      activeGesture={
-        type:"pan",pointerId:remainingId,start:remainingPoint,
-        panX:currentPage().view.panX,panY:currentPage().view.panY
-      };
+      const[remainingId,remainingPoint]=touchPoints.entries().next().value;
+      activeGesture={type:"pan",pointerId:remainingId,start:remainingPoint,panX:currentPage().view.panX,panY:currentPage().view.panY};
       saveSessionSoon();
-    }else if(activeGesture?.type==="pinch"&&touchPoints.size===0){
-      activeGesture=null;saveSessionSoon();
-    }else if(activeGesture?.type==="pan"&&activeGesture.pointerId===e.pointerId){
-      activeGesture=null;saveSessionSoon();
-    }
+    }else if(activeGesture?.type==="pinch"&&touchPoints.size===0){activeGesture=null;saveSessionSoon()}
+    else if(activeGesture?.type==="pan"&&activeGesture.pointerId===e.pointerId){activeGesture=null;saveSessionSoon()}
   }
 
-  if(activeStroke&&e.pointerId===activePointerId){
-    /* Capture the lift coordinate too. Very short ticks/dots can otherwise
-       contain only the initial point if Safari emitted no pointermove. */
-    appendStrokeEvent(e);
-    activeStroke=null;activePointerId=null;activePointerType=null;
-    commitHistoryAction();
-    inputStats.strokesCommitted++;updateInputDebug();
-    scheduleRender();
+  if(activePointerId===e.pointerId){
+    const q={clientX:e.clientX,clientY:e.clientY,pressure:normalisePressure(e.pressure)};
+    finishActiveAction(e.pointerId,q);
   }
+}
 
-  if(activeGesture?.pointerId===e.pointerId){
-    if(activeGesture.type==="lasso")finishLasso();
-    else if(["erase","moveSelection","resizeSelection"].includes(activeGesture.type))
-      commitHistoryAction();
+function onPointerCancel(e){
+  if(mode!=="maths")return;
+  e.preventDefault();
+  if(e.pointerType==="pen"){
+    e.stopPropagation();
+    inputStats.penCancel++;noteInput("CANCEL",e);
+    penIsDown=false;lastPenInteraction=performance.now();lastPointerPenEventAt=performance.now();
+    cancelStylusTouchCandidate();
+  }
+  if(activePointerId===e.pointerId)finishActiveAction(e.pointerId,null,{cancelled:true});
+  touchPoints.delete(e.pointerId);
+}
 
-    activeGesture=null;activePointerId=null;activePointerType=null;selectionOriginal=null;
-    scheduleRender();
+/* A missing pointerdown can occasionally still leave a pen click for a tiny
+   contact. Only create a dot if there was no just-committed stroke at almost
+   the same location, so this cannot duplicate normal handwriting. */
+function onPenClickFallback(e){
+  if(mode!=="maths"||e.pointerType!=="pen")return;
+  if(!["pen","highlighter"].includes(tool))return;
+  const q=pointerLocal(e);
+  const since=performance.now()-lastPenCommitAt;
+  const near=lastPenCommitPoint&&Math.hypot(e.clientX-lastPenCommitPoint.x,e.clientY-lastPenCommitPoint.y)<12;
+  if(since<90&&near)return;
+  if(activeStroke||activeGesture)return;
+
+  const d=screenToDoc(q.x,q.y);
+  beginDrawingActionAt(d,.5,makeSourceId("click",Math.round(performance.now())),"pen-click");
+  const id=activePointerId;
+  finishActiveAction(id,{clientX:e.clientX,clientY:e.clientY,pressure:.5});
+  inputStats.clickRecovered++;
+  inputStats.last="CLICK RECOVERED";
+  updateInputDebug();
+}
+
+function cancelUncommittedTouchAction(){
+  const p=currentPage();
+  const mutating=activeStroke||["erase","moveSelection","resizeSelection"].includes(activeGesture?.type);
+  if(mutating&&!sourceIsPen(activePointerType)){
+    ensureHistory(p);p.strokes=cloneStrokes(p.history[p.history.length-1]||[]);
+  }
+  if(!sourceIsPen(activePointerType)){
+    activeStroke=null;activePointerId=null;activePointerType=null;lassoPoints=[];selectionOriginal=null;
+    if(selection.length)recomputeSelectionBox();activeGesture=null;
   }
 }
 
